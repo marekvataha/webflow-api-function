@@ -8,27 +8,42 @@ let cache = {
 export async function handler(event, context) {
   const API_TOKEN = process.env.WEBFLOW_API_TOKEN;
   const COLLECTION_ID = "68a1d701da54a513636c4391";
+  const WEBFLOW_SECRET = process.env.WEBFLOW_WEBHOOK_SECRET; // 🔒 stored in Netlify
 
   const qs = event.queryStringParameters || {};
   const limit = Math.min(parseInt(qs.limit || "100", 10), 100);
   const offset = parseInt(qs.offset || "0", 10);
   const sortParam = qs.sort || "date-desc";
-  const forceRefresh = qs.refresh === "true"; // 🔄 manual override
+  const forceRefresh = qs.refresh === "true";
+
+  // 🔐 Determine if this request is from a secure Webflow webhook
+  const incomingSecret = event.headers["x-webflow-signature"] || event.headers["x-webflow-secret"];
+  const isWebhook = event.httpMethod === "POST" && incomingSecret === WEBFLOW_SECRET;
 
   try {
     const now = Date.now();
     const cacheIsValid = cache.items.length && now - cache.lastFetch < cache.ttl;
 
-    // ✅ Refresh cache when invalid or manually forced
-    if (!cacheIsValid || forceRefresh) {
-      console.log(forceRefresh ? "♻️ Forced cache refresh…" : "♻️ Refreshing cache (expired)...");
+    // ✅ Refresh cache when invalid, manually forced, or triggered by webhook
+    if (!cacheIsValid || forceRefresh || isWebhook) {
+      console.log(isWebhook ? "♻️ Cache refresh triggered by Webflow webhook…" :
+                  forceRefresh ? "♻️ Manual cache refresh…" : "♻️ Cache expired, refreshing…");
+
+      // Optional: block invalid POSTs
+      if (event.httpMethod === "POST" && !isWebhook) {
+        return {
+          statusCode: 403,
+          body: JSON.stringify({ error: "Unauthorized POST" })
+        };
+      }
+
       cache.items = await fetchAllFromWebflow(API_TOKEN, COLLECTION_ID);
       cache.lastFetch = now;
     } else {
       console.log("⚡ Serving from cache...");
     }
 
-    // ✅ Sort full dataset
+    // ✅ Sort
     let sorted = [...cache.items];
     if (sortParam.startsWith("date")) {
       sorted.sort((a, b) => {
@@ -38,7 +53,7 @@ export async function handler(event, context) {
       });
     }
 
-    // ✅ Slice requested portion
+    // ✅ Slice
     const paginated = sorted.slice(offset, offset + limit);
     const hasMore = offset + limit < sorted.length;
 
@@ -46,7 +61,7 @@ export async function handler(event, context) {
       statusCode: 200,
       headers: {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Headers": "Content-Type, X-Webflow-Signature, X-Webflow-Secret",
         "Content-Type": "application/json",
         "Cache-Control": "public, max-age=60, stale-while-revalidate=600"
       },
@@ -58,7 +73,7 @@ export async function handler(event, context) {
           total: sorted.length,
           hasMore,
           cachedAt: new Date(cache.lastFetch).toISOString(),
-          fromCache: !forceRefresh && cacheIsValid
+          fromCache: !(forceRefresh || isWebhook)
         }
       })
     };
