@@ -8,15 +8,16 @@ let cache = {
 export async function handler(event, context) {
   const API_TOKEN = process.env.WEBFLOW_API_TOKEN;
   const COLLECTION_ID = "68a1d701da54a513636c4391";
-  const WEBFLOW_SECRET = process.env.WEBFLOW_WEBHOOK_SECRET; // 🔒 stored in Netlify
+  const WEBFLOW_SECRET = process.env.WEBFLOW_WEBHOOK_SECRET;
 
   const qs = event.queryStringParameters || {};
   const limit = Math.min(parseInt(qs.limit || "100", 10), 100);
   const offset = parseInt(qs.offset || "0", 10);
   const sortParam = qs.sort || "date-desc";
   const forceRefresh = qs.refresh === "true";
+  const filterType = qs.filter || ""; // 🆕 supports ?filter=reports
 
-  // 🔐 Determine if this request is from a secure Webflow webhook
+  // 🔐 Webhook check
   const incomingSecret = event.headers["x-webflow-signature"] || event.headers["x-webflow-secret"];
   const isWebhook = event.httpMethod === "POST" && incomingSecret === WEBFLOW_SECRET;
 
@@ -24,17 +25,13 @@ export async function handler(event, context) {
     const now = Date.now();
     const cacheIsValid = cache.items.length && now - cache.lastFetch < cache.ttl;
 
-    // ✅ Refresh cache when invalid, manually forced, or triggered by webhook
+    // Refresh cache when invalid, forced, or triggered by webhook
     if (!cacheIsValid || forceRefresh || isWebhook) {
-      console.log(isWebhook ? "♻️ Cache refresh triggered by Webflow webhook…" :
+      console.log(isWebhook ? "♻️ Refresh triggered by Webflow webhook…" :
                   forceRefresh ? "♻️ Manual cache refresh…" : "♻️ Cache expired, refreshing…");
 
-      // Optional: block invalid POSTs
       if (event.httpMethod === "POST" && !isWebhook) {
-        return {
-          statusCode: 403,
-          body: JSON.stringify({ error: "Unauthorized POST" })
-        };
+        return { statusCode: 403, body: JSON.stringify({ error: "Unauthorized POST" }) };
       }
 
       cache.items = await fetchAllFromWebflow(API_TOKEN, COLLECTION_ID);
@@ -43,10 +40,16 @@ export async function handler(event, context) {
       console.log("⚡ Serving from cache...");
     }
 
+    // ✅ Apply filter BEFORE sorting/pagination
+    let filtered = [...cache.items];
+    if (filterType === "reports") {
+      const regex = /^Výroční zpráva\s\d{4}$/;
+      filtered = filtered.filter(item => regex.test(item.fieldData?.["name"] || ""));
+    }
+
     // ✅ Sort
-    let sorted = [...cache.items];
     if (sortParam.startsWith("date")) {
-      sorted.sort((a, b) => {
+      filtered.sort((a, b) => {
         const dateA = new Date(a.fieldData?.["datum-a-cas-publikovani"] || a.lastPublished).getTime();
         const dateB = new Date(b.fieldData?.["datum-a-cas-publikovani"] || b.lastPublished).getTime();
         return sortParam === "date-asc" ? dateA - dateB : dateB - dateA;
@@ -54,8 +57,8 @@ export async function handler(event, context) {
     }
 
     // ✅ Slice
-    const paginated = sorted.slice(offset, offset + limit);
-    const hasMore = offset + limit < sorted.length;
+    const paginated = filtered.slice(offset, offset + limit);
+    const hasMore = offset + limit < filtered.length;
 
     return {
       statusCode: 200,
@@ -70,10 +73,11 @@ export async function handler(event, context) {
         meta: {
           limit,
           offset,
-          total: sorted.length,
+          total: filtered.length,
           hasMore,
           cachedAt: new Date(cache.lastFetch).toISOString(),
-          fromCache: !(forceRefresh || isWebhook)
+          fromCache: !(forceRefresh || isWebhook),
+          filter: filterType || "none"
         }
       })
     };
