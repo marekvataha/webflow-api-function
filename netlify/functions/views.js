@@ -1,65 +1,46 @@
 // netlify/functions/views.js
-// Node 18+ function using Netlify Blobs for persistent counts.
-const { getStore } = require('@netlify/blobs');
+let viewsStore = {}; // slug -> number of views (temporary in-memory storage)
 
-// ---------- CORS ----------
+// --- CORS setup ---------------------------------------------------------------
 const ALLOWED_ORIGINS = [
-  'https://resolar-331643.webflow.io', // Webflow staging
-  'https://resolar.netlify.app',       // Netlify preview
-  // Add your production domain when live:
-  // 'https://resolar.cz',
+  'https://resolar-331643.webflow.io',  // Webflow staging
+  'https://resolar.netlify.app',        // Netlify preview
+  'https://resolar.cz',                 // your production domain (if used)
 ];
 
-function makeHeaders(origin) {
-  const allow = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+function makeCorsHeaders(origin) {
+  const ok = ALLOWED_ORIGINS.includes(origin);
+  const allowOrigin = ok ? origin : ALLOWED_ORIGINS[0];
   return {
-    'Access-Control-Allow-Origin': allow,
+    'Access-Control-Allow-Origin': allowOrigin,
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin',
     'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
   };
 }
 
-// Single JSON object stored in Netlify Blobs under key "counts"
-const store = getStore({ name: 'views-store' });
-const COUNTS_KEY = 'counts.json';
-
-async function readMap() {
-  const json = await store.get(COUNTS_KEY, { type: 'json' });
-  return json || {};
-}
-
-async function writeMap(map) {
-  await store.set(COUNTS_KEY, map);
-}
-
-function normalizeSlug(s) {
-  if (!s) return '';
-  return String(s).trim().toLowerCase();
-}
-
+// --- Handler ------------------------------------------------------------------
 exports.handler = async (event) => {
   const origin = event.headers.origin || '';
-  const headers = makeHeaders(origin);
+  const headers = makeCorsHeaders(origin);
 
-  // Preflight
+  // Handle preflight
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers };
   }
 
   try {
-    // GET /views?slugs=a,b,c  -> { counts: { a: 12, b: 0, c: 5 } }
+    // ------------------ READ COUNTS ------------------
     if (event.httpMethod === 'GET') {
-      const slugsParam = (event.queryStringParameters?.slugs || '').trim();
-      const slugs = slugsParam
-        ? slugsParam.split(',').map(normalizeSlug).filter(Boolean)
-        : [];
+      const slugsParam = event.queryStringParameters?.slugs || '';
+      const slugs = slugsParam.split(',').filter(Boolean);
 
-      const map = await readMap();
-      const counts = Object.fromEntries(slugs.map(s => [s, Number(map[s] || 0)]));
+      // Always return deterministic numbers
+      const counts = Object.fromEntries(
+        slugs.map(s => [s, viewsStore[s] ?? 0])
+      );
 
       return {
         statusCode: 200,
@@ -68,36 +49,27 @@ exports.handler = async (event) => {
       };
     }
 
-    // POST /views  body: { slug: "my-article" }  -> increments count
+    // ------------------ INCREMENT COUNT ------------------
     if (event.httpMethod === 'POST') {
-      let payload = {};
-      try {
-        payload = JSON.parse(event.body || '{}');
-      } catch {}
-
-      const slug = normalizeSlug(payload.slug);
+      const body = JSON.parse(event.body || '{}');
+      const slug = body.slug?.trim();
       if (!slug) {
         return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing slug' }) };
       }
 
-      // naive read-modify-write (adequate for low traffic)
-      const map = await readMap();
-      map[slug] = Number(map[slug] || 0) + 1;
-      await writeMap(map);
+      const current = viewsStore[slug] ?? 0;
+      viewsStore[slug] = current + 1;
 
       return {
         statusCode: 200,
         headers,
-        body: JSON.stringify({ ok: true, slug, views: map[slug] }),
+        body: JSON.stringify({ slug, views: viewsStore[slug] }),
       };
     }
 
+    // Unsupported
     return { statusCode: 405, headers, body: JSON.stringify({ error: 'Method not allowed' }) };
   } catch (err) {
-    return {
-      statusCode: 500,
-      headers,
-      body: JSON.stringify({ error: err?.message || 'Internal error' }),
-    };
+    return { statusCode: 500, headers, body: JSON.stringify({ error: err.message }) };
   }
 };
