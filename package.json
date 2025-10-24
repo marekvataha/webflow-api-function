@@ -1,0 +1,7 @@
+{
+  "name": "resolar-functions",
+  "type": "commonjs",
+  "dependencies": {
+    "@netlify/blobs": "^6.5.0"
+  }
+}
