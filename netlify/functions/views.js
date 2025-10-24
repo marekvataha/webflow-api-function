@@ -1,72 +1,61 @@
-// netlify/functions/views.js
-import { getStore } from '@netlify/blobs';
+// Classic Netlify Functions (Node 18+). Adjust to your data source as needed.
+const ALLOWED_ORIGINS = [
+  'https://resolar-331643.webflow.io',   // Webflow staging
+  'https://resolar.netlify.app',         // Netlify preview
+  'https://YOUR-PROD-DOMAIN.TLD',        // <-- add your real prod domain
+];
 
-const cors = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'Content-Type',
-  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-};
+function corsHeaders(origin) {
+  const ok = ALLOWED_ORIGINS.includes(origin);
+  return {
+    'Access-Control-Allow-Origin': ok ? origin : ALLOWED_ORIGINS[0],
+    'Vary': 'Origin',
+    'Access-Control-Allow-Methods': 'GET,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age': '86400',
+    'Cache-Control': 'no-store',
+    'Content-Type': 'application/json; charset=utf-8',
+  };
+}
 
-export async function handler(event) {
+exports.handler = async (event) => {
+  const origin = event.headers.origin || '';
+  const headers = corsHeaders(origin);
+
+  // Handle preflight
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: cors, body: '' };
+    return { statusCode: 204, headers, body: '' };
   }
 
-  const store = getStore({ name: 'global-views' }); // creates/uses a KV bucket named "global-views"
+  if (event.httpMethod !== 'GET') {
+    return { statusCode: 405, headers, body: JSON.stringify({ error: 'Method not allowed' }) };
+  }
 
   try {
-    if (event.httpMethod === 'GET') {
-      // GET /.netlify/functions/views?slugs=a,b,c
-      const qs = new URLSearchParams(event.rawQuery || '');
-      const slugs = (qs.get('slugs') || '')
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean);
+    // Expect ?slugs=a,b,c
+    const slugsParam = (event.queryStringParameters?.slugs || '').trim();
+    const slugs = slugsParam ? slugsParam.split(',').map(s => s.trim()).filter(Boolean) : [];
 
-      const counts = {};
-      // Fetch each slug’s count; default 0
-      for (const slug of slugs) {
-        const val = await store.get(slug);
-        counts[slug] = val ? parseInt(val, 10) || 0 : 0;
-      }
+    // TODO: Replace with your real store/DB lookup.
+    // Return 0 for unknown slugs so sorting still works.
+    const counts = Object.fromEntries(slugs.map(s => [s, await getViewsForSlug(s)]));
 
-      return {
-        statusCode: 200,
-        headers: { ...cors, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ counts }),
-      };
-    }
-
-    if (event.httpMethod === 'POST') {
-      // POST { slug: "vyrocni-zprava-2024" }
-      const body = JSON.parse(event.body || '{}');
-      const slug = (body.slug || '').trim();
-      if (!slug) {
-        return {
-          statusCode: 400,
-          headers: cors,
-          body: JSON.stringify({ error: 'Missing slug' }),
-        };
-      }
-
-      // naive increment (get -> +1 -> set). Good enough for low concurrency.
-      const current = await store.get(slug);
-      const next = (current ? parseInt(current, 10) || 0 : 0) + 1;
-      await store.set(slug, String(next));
-
-      return {
-        statusCode: 200,
-        headers: { ...cors, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ slug, views: next }),
-      };
-    }
-
-    return { statusCode: 405, headers: cors, body: 'Method Not Allowed' };
-  } catch (e) {
+    return {
+      statusCode: 200,
+      headers,
+      body: JSON.stringify({ counts }),
+    };
+  } catch (err) {
     return {
       statusCode: 500,
-      headers: cors,
-      body: JSON.stringify({ error: e.message }),
+      headers,
+      body: JSON.stringify({ error: err.message || 'Internal error' }),
     };
   }
+};
+
+// Dummy placeholder. Hook to your KV/DB/analytics.
+async function getViewsForSlug(slug) {
+  // e.g., read from Upstash/Redis, Fauna, D1, Supabase, etc.
+  return 0;
 }
