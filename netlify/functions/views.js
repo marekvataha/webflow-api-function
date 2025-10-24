@@ -1,75 +1,75 @@
 // netlify/functions/views.js
-// A lightweight, dependency-free function that tracks and returns views
-// Works without any npm installs or Netlify add-ons
+// Persistent view counter using Netlify Blobs (durable storage)
 
-// Temporary in-memory storage (resets after each deploy)
-let viewsStore = {}; // { slug: count }
+const { getStore } = require('@netlify/blobs');
 
-// ===== CORS SETUP ===========================================================
+// CORS allowlist
 const ALLOWED_ORIGINS = [
   'https://resolar-331643.webflow.io', // Webflow staging
   'https://resolar.netlify.app',       // Netlify preview
-  'https://resolar.cz',                // your live domain (optional)
+  'https://resolar.cz'                 // your live domain (add/change as needed)
 ];
 
 function makeCorsHeaders(origin) {
-  const ok = ALLOWED_ORIGINS.includes(origin);
-  const allowOrigin = ok ? origin : ALLOWED_ORIGINS[0];
+  const match = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
   return {
-    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Origin': match,
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin',
-    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Type': 'application/json; charset=utf-8'
   };
 }
 
-// ===== HANDLER ==============================================================
 exports.handler = async (event) => {
   const origin = event.headers.origin || '';
   const headers = makeCorsHeaders(origin);
 
-  // --- Preflight (OPTIONS) ---
+  // Preflight
   if (event.httpMethod === 'OPTIONS') {
     return { statusCode: 204, headers };
   }
 
+  // Strong consistency so reads reflect the latest write
+  const store = getStore({ name: 'views', consistency: 'strong' });
+
   try {
-    // --- GET: Return counts ---
     if (event.httpMethod === 'GET') {
+      // Read counts for ?slugs=a,b,c
       const slugsParam = event.queryStringParameters?.slugs || '';
-      const slugs = slugsParam.split(',').filter(Boolean);
-      const counts = Object.fromEntries(slugs.map(s => [s, viewsStore[s] ?? 0]));
+      const slugs = slugsParam.split(',').map(s => s.trim()).filter(Boolean);
+
+      const entries = await Promise.all(
+        slugs.map(async (slug) => {
+          const raw = await store.get(slug);              // returns string | null
+          const n = raw ? Number(raw) : 0;
+          return [slug, Number.isFinite(n) ? n : 0];
+        })
+      );
+
+      const counts = Object.fromEntries(entries);
       return { statusCode: 200, headers, body: JSON.stringify({ counts }) };
     }
 
-    // --- POST: Increment count ---
     if (event.httpMethod === 'POST') {
+      // Increment a single slug { slug: "some-slug" }
       const body = JSON.parse(event.body || '{}');
-      const slug = body.slug?.trim();
+      const slug = (body.slug || '').trim();
       if (!slug) {
         return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing slug' }) };
       }
 
-      const current = viewsStore[slug] ?? 0;
-      viewsStore[slug] = current + 1;
+      const currentRaw = await store.get(slug);
+      const current = currentRaw ? Number(currentRaw) : 0;
+      const next = (Number.isFinite(current) ? current : 0) + 1;
 
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({ slug, views: viewsStore[slug] }),
-      };
+      await store.set(slug, String(next));
+      return { statusCode: 200, headers, body: JSON.stringify({ slug, views: next }) };
     }
 
-    // --- Fallback for unsupported methods ---
     return { statusCode: 405, headers, body: JSON.stringify({ error: 'Method not allowed' }) };
-
   } catch (err) {
-    return {
-      statusCode: 500,
-      headers,
-      body: JSON.stringify({ error: err.message || 'Internal Server Error' }),
-    };
+    return { statusCode: 500, headers, body: JSON.stringify({ error: err.message || 'Internal error' }) };
   }
 };
