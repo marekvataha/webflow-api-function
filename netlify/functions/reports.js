@@ -13,9 +13,10 @@ export async function handler(event, context) {
   const qs = event.queryStringParameters || {};
   const limit = Math.min(parseInt(qs.limit || "100", 10), 100);
   const offset = parseInt(qs.offset || "0", 10);
-  const sortParam = qs.sort || "date-desc";
+  const sortParam = (qs.sort || "date-desc").toLowerCase(); // "date-desc" | "date-asc"
   const forceRefresh = qs.refresh === "true";
-  const filterType = qs.filter || ""; // 🆕 supports ?filter=reports
+  const filterType = (qs.filter || "").toLowerCase();       // "", "reports", "aktuality"  ✅ NEW
+  const excludeSlug = String(qs.excludeSlug || "").trim();  // slug to omit                ✅ NEW
 
   // 🔐 Webhook check
   const incomingSecret = event.headers["x-webflow-signature"] || event.headers["x-webflow-secret"];
@@ -27,36 +28,55 @@ export async function handler(event, context) {
 
     // Refresh cache when invalid, forced, or triggered by webhook
     if (!cacheIsValid || forceRefresh || isWebhook) {
-      console.log(isWebhook ? "♻️ Refresh triggered by Webflow webhook…" :
-                  forceRefresh ? "♻️ Manual cache refresh…" : "♻️ Cache expired, refreshing…");
+      console.log(
+        isWebhook ? "♻️ Refresh triggered by Webflow webhook…" :
+        forceRefresh ? "♻️ Manual cache refresh…" :
+        "♻️ Cache expired, refreshing…"
+      );
 
       if (event.httpMethod === "POST" && !isWebhook) {
         return { statusCode: 403, body: JSON.stringify({ error: "Unauthorized POST" }) };
-      }
-
+        }
       cache.items = await fetchAllFromWebflow(API_TOKEN, COLLECTION_ID);
       cache.lastFetch = now;
     } else {
       console.log("⚡ Serving from cache...");
     }
 
-    // ✅ Apply filter BEFORE sorting/pagination
+    // Helper: detect "Výroční zpráva 2024"
+    const reportNameRegex = /^Výroční zpráva\s\d{4}$/u;
+
+    // ✅ Apply filtering BEFORE sorting/pagination
     let filtered = [...cache.items];
+
     if (filterType === "reports") {
-      const regex = /^Výroční zpráva\s\d{4}$/;
-      filtered = filtered.filter(item => regex.test(item.fieldData?.["name"] || ""));
+      filtered = filtered.filter(item => reportNameRegex.test(item.fieldData?.["name"] || ""));
+    } else if (filterType === "aktuality") {
+      filtered = filtered.filter(item => !reportNameRegex.test(item.fieldData?.["name"] || ""));
+    }
+    // ✅ Exclude current article by slug BEFORE limiting
+    if (excludeSlug) {
+      filtered = filtered.filter(item => String(item.fieldData?.["slug"] || "") !== excludeSlug);
     }
 
     // ✅ Sort
+    const getItemTime = (it) => {
+      const manual = it.fieldData?.["datum-a-cas-publikovani"];
+      const auto   = it.lastPublished;
+      const chosen = manual || auto;
+      const d = chosen ? new Date(chosen) : null;
+      return d && !isNaN(d) ? d.getTime() : 0;
+    };
+
     if (sortParam.startsWith("date")) {
       filtered.sort((a, b) => {
-        const dateA = new Date(a.fieldData?.["datum-a-cas-publikovani"] || a.lastPublished).getTime();
-        const dateB = new Date(b.fieldData?.["datum-a-cas-publikovani"] || b.lastPublished).getTime();
-        return sortParam === "date-asc" ? dateA - dateB : dateB - dateA;
+        const aT = getItemTime(a);
+        const bT = getItemTime(b);
+        return sortParam === "date-asc" ? aT - bT : bT - aT; // default desc
       });
     }
 
-    // ✅ Slice
+    // ✅ Paginate AFTER filtering/sorting/exclusion so LIMIT is precise
     const paginated = filtered.slice(offset, offset + limit);
     const hasMore = offset + limit < filtered.length;
 
@@ -77,7 +97,8 @@ export async function handler(event, context) {
           hasMore,
           cachedAt: new Date(cache.lastFetch).toISOString(),
           fromCache: !(forceRefresh || isWebhook),
-          filter: filterType || "none"
+          filter: filterType || "none",
+          excludeSlug: excludeSlug || "none"
         }
       })
     };
