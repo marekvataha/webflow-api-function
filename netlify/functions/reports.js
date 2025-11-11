@@ -1,66 +1,38 @@
 // netlify/functions/reports.js
-let cache = {
-  items: [],
-  lastFetch: 0,
-  ttl: 1000 * 60 * 60 // 1 hour
-};
+// ❗️Simplest version: no in-memory cache, always hit Webflow LIVE items,
+// server-side filter+sort+paginate, and return no-store headers.
 
-export async function handler(event, context) {
-  const API_TOKEN = process.env.WEBFLOW_API_TOKEN;
-  const COLLECTION_ID = "68a1d701da54a513636c4391";
-  const WEBFLOW_SECRET = process.env.WEBFLOW_WEBHOOK_SECRET;
+export async function handler(event) {
+  const API_TOKEN     = process.env.WEBFLOW_API_TOKEN;
+  const COLLECTION_ID = process.env.WEBFLOW_COLLECTION_ID || "68a1d701da54a513636c4391";
 
   const qs = event.queryStringParameters || {};
-  const limit = Math.min(parseInt(qs.limit || "100", 10), 100);
-  const offset = parseInt(qs.offset || "0", 10);
-  const sortParam = (qs.sort || "date-desc").toLowerCase(); // "date-desc" | "date-asc"
-  const forceRefresh = qs.refresh === "true";
-  const filterType = (qs.filter || "").toLowerCase();       // "", "reports", "aktuality"  ✅ NEW
-  const excludeSlug = String(qs.excludeSlug || "").trim();  // slug to omit                ✅ NEW
-
-  // 🔐 Webhook check
-  const incomingSecret = event.headers["x-webflow-signature"] || event.headers["x-webflow-secret"];
-  const isWebhook = event.httpMethod === "POST" && incomingSecret === WEBFLOW_SECRET;
+  const limit       = Math.min(parseInt(qs.limit  || "100", 10), 100);
+  const offset      = parseInt(qs.offset || "0", 10);
+  const sortParam   = (qs.sort   || "date-desc").toLowerCase();   // "date-desc" | "date-asc"
+  const filterType  = (qs.filter || "").toLowerCase();            // "", "reports", "aktuality"
+  const excludeSlug = String(qs.excludeSlug || "").trim();
 
   try {
-    const now = Date.now();
-    const cacheIsValid = cache.items.length && now - cache.lastFetch < cache.ttl;
+    // 1) Fetch ALL published (live) items from Webflow (paged by 100)
+    const allItems = await fetchAllFromWebflowLive(API_TOKEN, COLLECTION_ID);
 
-    // Refresh cache when invalid, forced, or triggered by webhook
-    if (!cacheIsValid || forceRefresh || isWebhook) {
-      console.log(
-        isWebhook ? "♻️ Refresh triggered by Webflow webhook…" :
-        forceRefresh ? "♻️ Manual cache refresh…" :
-        "♻️ Cache expired, refreshing…"
-      );
-
-      if (event.httpMethod === "POST" && !isWebhook) {
-        return { statusCode: 403, body: JSON.stringify({ error: "Unauthorized POST" }) };
-        }
-      cache.items = await fetchAllFromWebflow(API_TOKEN, COLLECTION_ID);
-      cache.lastFetch = now;
-    } else {
-      console.log("⚡ Serving from cache...");
-    }
-
-    // Helper: detect "Výroční zpráva 2024"
+    // 2) Filter (reports / aktuality) BEFORE sort/paginate
     const reportNameRegex = /^Výroční zpráva\s\d{4}$/u;
-
-    // ✅ Apply filtering BEFORE sorting/pagination
-    let filtered = [...cache.items];
+    let filtered = allItems;
 
     if (filterType === "reports") {
-      filtered = filtered.filter(item => reportNameRegex.test(item.fieldData?.["name"] || ""));
+      filtered = filtered.filter(it => reportNameRegex.test((it.fieldData?.["name"] || "").trim()));
     } else if (filterType === "aktuality") {
-      filtered = filtered.filter(item => !reportNameRegex.test(item.fieldData?.["name"] || ""));
-    }
-    // ✅ Exclude current article by slug BEFORE limiting
-    if (excludeSlug) {
-      filtered = filtered.filter(item => String(item.fieldData?.["slug"] || "") !== excludeSlug);
+      filtered = filtered.filter(it => !reportNameRegex.test((it.fieldData?.["name"] || "").trim()));
     }
 
-    // ✅ Sort
-    const getItemTime = (it) => {
+    if (excludeSlug) {
+      filtered = filtered.filter(it => String(it.fieldData?.["slug"] || "") !== excludeSlug);
+    }
+
+    // 3) Sort (date asc/desc)
+    const getTime = (it) => {
       const manual = it.fieldData?.["datum-a-cas-publikovani"];
       const auto   = it.lastPublished;
       const chosen = manual || auto;
@@ -70,15 +42,16 @@ export async function handler(event, context) {
 
     if (sortParam.startsWith("date")) {
       filtered.sort((a, b) => {
-        const aT = getItemTime(a);
-        const bT = getItemTime(b);
-        return sortParam === "date-asc" ? aT - bT : bT - aT; // default desc
+        const ta = getTime(a);
+        const tb = getTime(b);
+        return sortParam === "date-asc" ? (ta - tb) : (tb - ta);
       });
     }
 
-    // ✅ Paginate AFTER filtering/sorting/exclusion so LIMIT is precise
-    const paginated = filtered.slice(offset, offset + limit);
-    const hasMore = offset + limit < filtered.length;
+    // 4) Paginate AFTER filter/sort
+    const total   = filtered.length;
+    const items   = filtered.slice(offset, offset + limit);
+    const hasMore = offset + limit < total;
 
     return {
       statusCode: 200,
@@ -86,29 +59,23 @@ export async function handler(event, context) {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "Content-Type, X-Webflow-Signature, X-Webflow-Secret",
         "Content-Type": "application/json",
-        "Cache-Control": "public, max-age=60, stale-while-revalidate=600"
+        // 🚫 Do not cache at browser/CDN
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache"
       },
       body: JSON.stringify({
-        items: paginated,
-        meta: {
-          limit,
-          offset,
-          total: filtered.length,
-          hasMore,
-          cachedAt: new Date(cache.lastFetch).toISOString(),
-          fromCache: !(forceRefresh || isWebhook),
-          filter: filterType || "none",
-          excludeSlug: excludeSlug || "none"
-        }
+        items,
+        meta: { limit, offset, total, hasMore, filter: filterType || "none", excludeSlug: excludeSlug || "none" }
       })
     };
   } catch (err) {
-    console.error("❌ Netlify function error:", err);
+    console.error("❌ reports function error:", err);
     return {
       statusCode: 500,
       headers: {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Content-Type"
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Cache-Control": "no-store"
       },
       body: JSON.stringify({ error: err.message })
     };
@@ -116,37 +83,37 @@ export async function handler(event, context) {
 }
 
 // —————————————————————————————
-// Fetch all items from Webflow (once per hour or on refresh)
+// Fetch ALL published items from Webflow (LIVE)
 // —————————————————————————————
-async function fetchAllFromWebflow(API_TOKEN, COLLECTION_ID) {
+async function fetchAllFromWebflowLive(API_TOKEN, COLLECTION_ID) {
   const PAGE_LIMIT = 100;
   let offset = 0;
-  let allItems = [];
+  let all = [];
 
   while (true) {
-    const res = await fetch(
-      `https://api.webflow.com/v2/collections/${COLLECTION_ID}/items?limit=${PAGE_LIMIT}&offset=${offset}`,
-      {
-        headers: {
-          Authorization: `Bearer ${API_TOKEN}`,
-          Accept: "application/json"
-        }
+    const url = new URL(`https://api.webflow.com/v2/collections/${COLLECTION_ID}/items/live`);
+    url.searchParams.set("limit",  String(PAGE_LIMIT));
+    url.searchParams.set("offset", String(offset));
+
+    const res = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${API_TOKEN}`,
+        Accept: "application/json"
       }
-    );
+    });
 
     if (!res.ok) {
       const txt = await res.text();
       throw new Error(`Webflow API responded ${res.status}: ${txt}`);
     }
 
-    const data = await res.json();
+    const data  = await res.json();
     const items = Array.isArray(data.items) ? data.items : [];
-    allItems = allItems.concat(items);
+    all = all.concat(items);
 
     if (items.length < PAGE_LIMIT) break;
     offset += PAGE_LIMIT;
   }
 
-  console.log(`✅ Cached ${allItems.length} items from Webflow`);
-  return allItems;
+  return all;
 }
